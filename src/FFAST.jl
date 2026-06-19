@@ -3,6 +3,7 @@ module FFAST
 using Requires
 using DataFrames
 using CSV
+using Unitful
 
 # This type identifies the class of MAC to compute
 abstract type MassAbsorptionCoefficientType end

@@ -1,4 +1,5 @@
 using Test, FFAST
+using Unitful
 
 @testset "Iron" begin
     @test length(eachedge(26)) == 9
@@ -214,4 +215,35 @@ end
     @test isapprox(mac(PhotoElectricMAC, 90, 142.6819), 6556.7729, rtol = 0.001)
     @test isapprox(mac(PhotoElectricMAC, 91, 51.2632), 8270.9798, rtol = 0.001)
     @test isapprox(mac(PhotoElectricMAC, 92, 51.8461), 13886.1866, rtol = 0.001)
+end
+
+@testset "Energy argument types" begin
+    # A bare number is interpreted as eV regardless of its concrete numeric type.
+    ref = mac(PhotoElectricMAC, 26, 1234.0)
+    @test mac(PhotoElectricMAC, 26, 1234) == ref            # Int
+    @test mac(PhotoElectricMAC, 26, Float32(1234.0)) ≈ ref  # Float32
+
+    # Unitful energy quantities are converted to eV.
+    @test mac(PhotoElectricMAC, 26, 1234.0u"eV") == ref
+    @test mac(PhotoElectricMAC, 26, 1.234u"keV") ≈ ref
+    @test mac(TotalMAC, 26, 1.234u"keV") ≈ mac(TotalMAC, 26, 1234.0)
+
+    # The other energy-taking entry points accept the same argument types.
+    @test formfactors(26, 1.234u"keV") == formfactors(26, 1234.0)
+    @test FFAST.findindex(26, 1.234u"keV") == FFAST.findindex(26, 1234.0)
+    @test fractionaluncertainty(SolidLiquid, 26, 1.234u"keV") ==
+          fractionaluncertainty(SolidLiquid, 26, 1234.0)
+end
+
+@testset "jumpratio" begin
+    # Missing entries (and elements without data) return 1.0.
+    @test jumpratio(1, 1) == 1.0
+    @test jumpratio(2, 1) == 1.0
+    @test jumpratio(26, 9) == 1.0  # beyond the tabulated row for iron
+    # Tabulated values, including the formerly single-element rows.
+    @test jumpratio(3, 1) ≈ 48.3369
+    @test jumpratio(4, 1) ≈ 38.5279
+    @test jumpratio(26, 1) ≈ 8.23916
+    @test jumpratio(26, 2) ≈ 1.12325
+    @test jumpratio(92, 9) ≈ 2.12567
 end

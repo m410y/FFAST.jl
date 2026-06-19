@@ -1,41 +1,97 @@
 using DataFrames
 using CSV
+using Unitful
 
+"""
+    EnergyArgument
+
+Accepted types for an X-ray energy argument: either a bare `Real` (interpreted
+as a value in eV) or a `Unitful.Energy` quantity carrying its own units
+(e.g. `5u"keV"`, `1.2u"J"`).  Use [`aseV`](@ref) to normalize such a value to a
+`Float64` in eV.
+"""
+const EnergyArgument = Union{Real, Unitful.Energy}
+
+"""
+    aseV(energy)::Float64
+
+Normalizes an energy argument to a `Float64` in eV.  A bare number is assumed to
+already be in eV, while a `Unitful.Energy` quantity is converted from its own
+units.  This lets the public API accept `Int`, `Float32`, `Float64`, or any
+unitful energy interchangeably.
+"""
+aseV(energy::Real) = Float64(energy)
+aseV(energy::Unitful.Energy) = Float64(ustrip(u"eV", energy))
+
+# Subset of atomic shells for which the shell-data file provides edge energies.
+const FFAST_SHELLS = (
+    :K, :L1, :L2, :L3, :M1, :M2, :M3, :M4, :M5, :N1, :N2, :N3, :N4,
+    :N5, :N6, :N7, :O1, :O2, :O3, :O4, :O5, :P1, :P2, :P3,
+)
+
+# Full, ordered list of shells.  The 1-based index of a shell in this tuple is
+# the integer shell identifier used throughout the public API.
+const ALL_SHELLS = (
+    :K, :L1, :L2, :L3, :M1, :M2, :M3, :M4, :M5, :N1, :N2, :N3, :N4,
+    :N5, :N6, :N7, :O1, :O2, :O3, :O4, :O5, :O6, :O7, :O8, :O9, :P1,
+    :P2, :P3, :P4, :P5, :P6, :P7, :P8, :P9, :P10, :P11,
+)
+
+# Scalar per-element quantities pulled from the shell-data file.
+const SCALAR_COLUMNS = (:A, :xsec, :density, :ev, :rc1, :rc2, :nt)
+
+# Maps a shell symbol to its integer identifier (its position in ALL_SHELLS).
+const SHELL_INDEX = Dict(sh => i for (i, sh) in enumerate(ALL_SHELLS))
+
+"""
+    FFASTElement
+
+Holds the FFAST data for a single element: the tabulated energy grid, scalar
+per-element quantities, absorption-edge energies keyed by shell index, and the
+form-factor / MAC table.
+"""
 struct FFASTElement
-    energy::Vector{Float64} # in eV
-    data::Dict{Symbol, Float64}
-    edgeEnergies::Dict{Int, Float64}
-    macs::DataFrame # Form factor and MAC data
+    energy::Vector{Float64}             # Energy grid in eV
+    data::Dict{Symbol, Float64}         # Scalar quantities (see SCALAR_COLUMNS)
+    edgeEnergies::Dict{Int, Float64}    # Shell index => edge energy in eV
+    macs::DataFrame                     # Form-factor and MAC data, aligned to `energy`
+
     function FFASTElement(ev, sup, mac)
-        ffastShells = ( :K, :L1, :L2, :L3, :M1, :M2, :M3, :M4, :M5, :N1, :N2, :N3, :N4,
-                        :N5, :N6, :N7, :O1, :O2, :O3, :O4, :O5, :P1, :P2, :P3 )
-        allshells = ( :K, :L1, :L2, :L3, :M1, :M2, :M3, :M4, :M5, :N1, :N2, :N3, :N4,
-                      :N5, :N6, :N7, :O1, :O2, :O3, :O4, :O5, :O6, :O7, :O8, :O9, :P1,
-                      :P2, :P3, :P4, :P5, :P6, :P7, :P8, :P9, :P10, :P11 )
-        data = Dict( ( sh, convert(Float64, sup[1,sh]) ) for sh in ( :A, :xsec, :density, :ev, :rc1, :rc2, :nt ) )
+        # Collect the scalar quantities, coercing each to Float64.
+        data = Dict(sh => convert(Float64, sup[1, sh]) for sh in SCALAR_COLUMNS)
+        # Collect edge energies, keyed by the integer shell identifier.  Missing
+        # table entries mean the element has no edge for that shell.
         ee = Dict{Int, Float64}()
-        for sh in ffastShells
-            if !ismissing(sup[1,sh])
-                ee[findfirst(s->s==sh,allshells)] = convert(Float64, sup[1,sh])
+        for sh in FFAST_SHELLS
+            if !ismissing(sup[1, sh])
+                ee[SHELL_INDEX[sh]] = convert(Float64, sup[1, sh])
             end
         end
         return new(ev, data, ee, mac)
     end
 end
 
+"""
+    loadFFAST()::NTuple{92,FFASTElement}
+
+Reads the shell-data table and the per-element MAC tables from the package's
+`data` directory, returning one `FFASTElement` for each element Z = 1:92.
+"""
 function loadFFAST()::NTuple{92,FFASTElement}
     path = dirname(pathof(@__MODULE__))
-    res = Vector{FFASTElement}()
-    shelldata = CSV.read(joinpath(path,"..","data","shelldata.csv"), DataFrame, header=1)
+    datapath = joinpath(path, "..", "data")
+    shelldata = CSV.read(joinpath(datapath, "shelldata.csv"), DataFrame, header=1)
+    res = Vector{FFASTElement}(undef, 92)
     for z in 1:92
-        # println("Loading z = $(z)")
-        macs = CSV.read(joinpath(path,"..","data","mac[$(z)].csv"), DataFrame, header=1)
-        # mapcols(x->convert.(Float64,x), macs) # ensure Float64
-        push!(res, FFASTElement(1000.0 * macs[!,1], shelldata[[z],:], macs))
+        macs = CSV.read(joinpath(datapath, "mac[$(z)].csv"), DataFrame, header=1)
+        # The first MAC column holds the energy grid in keV; convert it to eV.
+        res[z] = FFASTElement(1000.0 * macs[!, 1], shelldata[[z], :], macs)
     end
     return tuple(res...)
 end
 
+# Load the data once at module initialization and expose it through a closure so
+# it is parsed a single time and shared across all queries.
 let FFASTData = loadFFAST()
     global getFFASTData() = FFASTData
 end
@@ -123,11 +179,20 @@ relativisticcorrection(z::Int) = ( getFFASTData()[z].data[:rc1], getFFASTData()[
 """
     nuclearthompsoncorrection(z::Int)::Float64
 
-Nuclear Thomson correction fₙₜ</sub> in e/atom.
+Nuclear Thomson correction fₙₜ in e/atom.
 """
 nuclearthompsoncorrection(z::Int) = getFFASTData()[z].data[:nt]
 
-function findindex(z::Int, energy::Float64)
+"""
+    findindex(z::Int, energy::EnergyArgument)
+
+Returns the index of the energy-grid sample immediately at or below `energy` for
+element `z`, located with a binary search.  This is the lower bound of the
+interval used for interpolation.  `energy` may be a plain number in eV or a
+`Unitful.Energy` quantity (see [`aseV`](@ref)).
+"""
+function findindex(z::Int, energy::EnergyArgument)
+    # Binary search for the largest index whose value is <= `value`.
     function binarysearch(array, value)
         start, stop = 1, length(array)
         while stop - start > 1
@@ -137,94 +202,104 @@ function findindex(z::Int, energy::Float64)
         end
         return start
     end
+    e = aseV(energy)
     df = getFFASTData()[z]
-    @assert energy >= 0.0 "energy < 0.0 in ffastMAC"
-    @assert energy <= df.energy[end] "Energy too large in ffastMAC"
-    return binarysearch(df.energy, max(df.energy[1], energy))
+    @assert e >= 0.0 "energy < 0.0 in ffastMAC"
+    @assert e <= df.energy[end] "Energy too large in ffastMAC"
+    # Clamp to the first grid point so energies below the table still interpolate.
+    return binarysearch(df.energy, max(df.energy[1], e))
 end
 
+# Linear interpolation of (x, y) between two points.
 linearInterp(x1, x2, y1, y2, x) =
     ((y2 - y1) / (x2 - x1)) * (x - x1) + y1
 
+# Log-log interpolation of (x, y) between two points, as used for power-law data.
 loglogInterp(x0, x1, y0, y1, x) =
     exp(log(y1 / y0) / log(x1 / x0) * log(x / x0) + log(y0))
 
-"""
-    formfactors(z::Int, energy::Float64)::Tuple{Float64,Float64}
-
-Returns a tuple containing the form factors for the specified element and X-ray energy (in eV).
-"""
-function formfactors(z::Int, energy::Float64)
-    idx = findindex(z, energy)
-    ffd = getFFASTData()[z]
-    return (loglogInterp(ffd.energy[idx], ffd.energy[idx + 1], ffd.macs[idx,:f1], ffd.macs[idx + 1,:f1], energy),
-             loglogInterp(ffd.energy[idx], ffd.energy[idx + 1], ffd.macs[idx,:f2], ffd.macs[idx + 1,:f2], energy))
+# Log-log interpolates the named MAC/form-factor column at `energy` (in eV),
+# using the grid interval that starts at `idx`.
+function interpcolumn(ffd::FFASTElement, idx::Int, column::Symbol, energy::Float64)
+    return loglogInterp(ffd.energy[idx], ffd.energy[idx + 1],
+                        ffd.macs[idx, column], ffd.macs[idx + 1, column], energy)
 end
 
 """
-    mac(::Type{PhotoElectricMAC}, z::Int, energy::Float64)::Float64
+    formfactors(z::Int, energy::EnergyArgument)::Tuple{Float64,Float64}
 
-Returns the photoelectric attenuation coefficient in cm²/g for the specified element and X-ray energy (in eV).
+Returns a tuple containing the form factors for the specified element and X-ray
+energy.  `energy` may be a plain number in eV or a `Unitful.Energy` quantity.
 """
-function mac(::Type{PhotoElectricMAC}, z::Int, energy::Float64)
-    idx = findindex(z, energy)
+function formfactors(z::Int, energy::EnergyArgument)
+    e = aseV(energy)
+    idx = findindex(z, e)
     ffd = getFFASTData()[z]
-    return ffd.macs[idx, :μρpe] > 0 ? #
-        loglogInterp(ffd.energy[idx], ffd.energy[idx + 1], ffd.macs[idx,:μρpe], ffd.macs[idx + 1,:μρpe], energy) : #
-        0.0
+    return (interpcolumn(ffd, idx, :f1, e), interpcolumn(ffd, idx, :f2, e))
 end
 
 """
-    mac(::Type{CoherentIncoherentMAC}, z::Int, energy::Float64)::Float64
+    mac(::Type{PhotoElectricMAC}, z::Int, energy::EnergyArgument)::Float64
 
-Returns the coherent/incoherent attenuation coefficient in cm²/g for the specified element and X-ray energy (in eV).
+Returns the photoelectric attenuation coefficient in cm²/g for the specified
+element and X-ray energy (a number in eV or a `Unitful.Energy` quantity).
 """
-function mac(::Type{CoherentIncoherentMAC}, z::Int, energy::Float64)
-    idx = findindex(z, energy)
+function mac(::Type{PhotoElectricMAC}, z::Int, energy::EnergyArgument)
+    e = aseV(energy)
+    idx = findindex(z, e)
     ffd = getFFASTData()[z]
-    return loglogInterp(ffd.energy[idx], ffd.energy[idx + 1], ffd.macs[idx,:μρci], ffd.macs[idx + 1,:μρci], energy)
+    # The tabulated value is zero below the photoelectric threshold; avoid log(0).
+    return ffd.macs[idx, :μρpe] > 0 ? interpcolumn(ffd, idx, :μρpe, e) : 0.0
 end
 
 """
-    mac(::Type{TotalMAC}, z::Int, energy::Float64)::Float64
+    mac(::Type{CoherentIncoherentMAC}, z::Int, energy::EnergyArgument)::Float64
 
-Returns the total attenuation coefficient in cm²/g for the specified element and X-ray energy (in eV).
+Returns the coherent/incoherent attenuation coefficient in cm²/g for the specified
+element and X-ray energy (a number in eV or a `Unitful.Energy` quantity).
 """
-function mac(::Type{TotalMAC} ,z::Int, energy::Float64)
-    idx = findindex(z, energy)
-    ffd = getFFASTData()[z]
-    return loglogInterp(ffd.energy[idx], ffd.energy[idx + 1], ffd.macs[idx,:μρtot], ffd.macs[idx + 1,:μρtot], energy)
+function mac(::Type{CoherentIncoherentMAC}, z::Int, energy::EnergyArgument)
+    e = aseV(energy)
+    idx = findindex(z, e)
+    return interpcolumn(getFFASTData()[z], idx, :μρci, e)
 end
 
 """
-    mac(::Type{KMAC}, z::Int, energy::Float64)::Float64
+    mac(::Type{TotalMAC}, z::Int, energy::EnergyArgument)::Float64
 
-Returns the K-shell only attenuation coefficient in cm²/g for the specified element and X-ray energy (in eV).
+Returns the total attenuation coefficient in cm²/g for the specified element and
+X-ray energy (a number in eV or a `Unitful.Energy` quantity).
 """
-function mac(::Type{KMAC} ,z::Int, energy::Float64)
-    idx = findindex(z, energy)
-    ffd = getFFASTData()[z]
-    return energy > edgeenergy(z,1) ?
-        loglogInterp(ffd.energy[idx], ffd.energy[idx + 1], ffd.macs[idx,:μρK], ffd.macs[idx + 1,:μρK], energy) :
-        0.0
+function mac(::Type{TotalMAC}, z::Int, energy::EnergyArgument)
+    e = aseV(energy)
+    idx = findindex(z, e)
+    return interpcolumn(getFFASTData()[z], idx, :μρtot, e)
 end
 
 """
-    jumpratio(z::Int, subshell::Int)::Float64
+    mac(::Type{KMAC}, z::Int, energy::EnergyArgument)::Float64
 
-Returns the jump-ratio for the specified element and subshell.  This implementation is
-based on jump ratio data extracted from FFAST taken from
-https://github.com/openmicroanalysis/calczaf/blob/master/jump_ratios.dat.
-Returns 1.0 if data isn't available.
+Returns the K-shell only attenuation coefficient in cm²/g for the specified
+element and X-ray energy (a number in eV or a `Unitful.Energy` quantity).
 """
-function jumpratio(z::Int, ss::Int)::Float64
-    # Jump ratio data from https://github.com/openmicroanalysis/calczaf/blob/master/jump_ratios.dat
-    data = (
+function mac(::Type{KMAC}, z::Int, energy::EnergyArgument)
+    e = aseV(energy)
+    idx = findindex(z, e)
+    ffd = getFFASTData()[z]
+    # Only contributes above the K edge; below it the K-shell MAC is zero.
+    return e > edgeenergy(z, 1) ? interpcolumn(ffd, idx, :μρK, e) : 0.0
+end
+
+# Jump-ratio table indexed by atomic number Z (row) then subshell (column),
+# ordered K, L1, L2, L3, M1, M2, M3, M4, M5.  A row is truncated where no further
+# data is available; a missing entry implies a jump ratio of 1.0.
+# Source: https://github.com/openmicroanalysis/calczaf/blob/master/jump_ratios.dat
+const JUMP_RATIOS = (
         # K,L1,L2,L3,M1,M2,M3,M4,M5 (empty values => 1.0)
         (),
         (),
-        ( 48.3369 ),
-        ( 38.5279 ),
+        ( 48.3369, ),
+        ( 38.5279, ),
         ( 26.8689,1.24508 ),
         ( 22.0932,1.10201 ),
         ( 20.0421,1.05658 ),
@@ -312,7 +387,18 @@ function jumpratio(z::Int, ss::Int)::Float64
         ( 3.77084,1.1349,1.37851,2.36235,1.03461,1.05624,1.15939,1.39846,2.57223 ),
         ( 3.72921,1.13451,1.38067,2.34855,1.02847,1.04842,1.16083,1.44851,2.3558 ),
         ( 3.68017,1.13418,1.38265,2.33962,1.02881,1.04821,1.14862,1.43401,2.20859 ),
-        ( 3.64804,1.134,1.38421,2.32879,1.02883,1.04867,1.14181,1.36989,2.12567 )
-    )
-    return length(data[z]) >= ss ? data[z][ss] : 1.0
+        ( 3.64804,1.134,1.38421,2.32879,1.02883,1.04867,1.14181,1.36989,2.12567 ),
+)
+
+"""
+    jumpratio(z::Int, subshell::Int)::Float64
+
+Returns the jump-ratio for the specified element and subshell.  This implementation is
+based on jump ratio data extracted from FFAST taken from
+https://github.com/openmicroanalysis/calczaf/blob/master/jump_ratios.dat.
+Returns 1.0 if data isn't available.
+"""
+function jumpratio(z::Int, subshell::Int)::Float64
+    row = JUMP_RATIOS[z]
+    return length(row) >= subshell ? row[subshell] : 1.0
 end
